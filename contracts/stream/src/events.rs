@@ -331,6 +331,14 @@ pub fn milestone_released(env: &Env, stream_id: u64, milestone_index: u32) {
     );
 }
 
+/// Emitted when an oracle or multisig approves one milestone.
+pub fn milestone_approved(env: &Env, stream_id: u64, milestone_index: u32, approver: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "MilestoneApproved"), stream_id),
+        (milestone_index, approver.clone()),
+    );
+}
+
 /// Emitted when an auto-renewal is cancelled for a stream.
 pub fn auto_renew_cancelled(env: &Env, stream_id: u64) {
     let nonce = crate::storage::next_stream_event_nonce(env, stream_id);

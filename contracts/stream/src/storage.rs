@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use crate::types::{AuditEntry, Stream, VestingTranche};
+use crate::types::{AuditEntry, Stream, StreamTransition, VestingTranche};
 use soroban_sdk::{Address, Bytes, BytesN, Env, String, Symbol, Vec, xdr::ToXdr};
 
 const ADMIN_KEY: &str = "admin";
@@ -100,7 +100,24 @@ pub fn get_global_stream_at(env: &Env, idx: u32) -> Option<u64> {
 
 /// Persists a stream to storage.
 pub fn save_stream(env: &Env, stream: &Stream) {
+    let previous = load_stream(env, stream.id);
     env.storage().persistent().set(&stream.id, stream);
+
+    let previous_status = previous.map(|previous_stream| previous_stream.status);
+    if previous_status.as_ref() != Some(&stream.status) {
+        let is_creation = previous_status.is_none();
+        let from_status = previous_status.unwrap_or_else(|| stream.status.clone());
+        append_stream_transition(
+            env,
+            stream.id,
+            &StreamTransition {
+                from_status,
+                to_status: stream.status.clone(),
+                is_creation,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
 }
 
 /// Loads a stream from storage. Returns None if not found.
@@ -170,6 +187,12 @@ pub fn index_by_sender(env: &Env, sender: &Address, stream_id: u64) {
     env.storage().persistent().set(&sender_slot_key(env, sender, idx), &stream_id);
     let next = idx.checked_add(1).expect("sender index overflow");
     env.storage().persistent().set(&cnt_key, &next);
+    if load_stream(env, stream_id)
+        .map(|stream| stream.status == crate::types::StreamStatus::Active)
+        .unwrap_or(false)
+    {
+        index_active_by_sender(env, sender, stream_id);
+    }
 }
 
 /// Appends a stream ID to the recipient's index using counter+slot keys.
@@ -186,6 +209,7 @@ pub fn index_by_recipient(env: &Env, recipient: &Address, stream_id: u64) {
 
 /// Removes a stream ID from the sender's index (swap-and-pop).
 pub fn unindex_by_sender(env: &Env, sender: &Address, stream_id: u64) {
+    unindex_active_by_sender(env, sender, stream_id);
     let cnt_key = sender_count_key(env, sender);
     let cnt: u32 = env.storage().persistent().get(&cnt_key).unwrap_or(0u32);
     for i in 0..cnt {
@@ -203,6 +227,73 @@ pub fn unindex_by_sender(env: &Env, sender: &Address, stream_id: u64) {
             }
         }
     }
+}
+
+// --- Active sender index ---
+
+fn active_sender_count_key(env: &Env, addr: &Address) -> (Symbol, Address) {
+    (Symbol::new(env, "asc"), addr.clone())
+}
+
+fn active_sender_slot_key(env: &Env, addr: &Address, idx: u32) -> (Symbol, Address, u32) {
+    (Symbol::new(env, "as"), addr.clone(), idx)
+}
+
+/// Adds a stream to the sender's active-only index.
+pub fn index_active_by_sender(env: &Env, sender: &Address, stream_id: u64) {
+    let count_key = active_sender_count_key(env, sender);
+    let idx: u32 = env.storage().persistent().get(&count_key).unwrap_or(0u32);
+    env.storage()
+        .persistent()
+        .set(&active_sender_slot_key(env, sender, idx), &stream_id);
+    env.storage()
+        .persistent()
+        .set(&count_key, &idx.checked_add(1).expect("active sender index overflow"));
+}
+
+/// Removes a stream from the sender's active-only index using swap-and-pop.
+pub fn unindex_active_by_sender(env: &Env, sender: &Address, stream_id: u64) {
+    let count_key = active_sender_count_key(env, sender);
+    let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0u32);
+    for i in 0..count {
+        let slot_key = active_sender_slot_key(env, sender, i);
+        if env.storage().persistent().get::<_, u64>(&slot_key) == Some(stream_id) {
+            let last = count - 1;
+            if i != last {
+                let last_id: u64 = env
+                    .storage()
+                    .persistent()
+                    .get(&active_sender_slot_key(env, sender, last))
+                    .unwrap_or(0);
+                env.storage().persistent().set(&slot_key, &last_id);
+            }
+            env.storage()
+                .persistent()
+                .remove(&active_sender_slot_key(env, sender, last));
+            env.storage().persistent().set(&count_key, &last);
+            return;
+        }
+    }
+}
+
+/// Returns active stream IDs for a sender without scanning terminal streams.
+pub fn get_active_ids_by_sender(env: &Env, sender: &Address) -> Vec<u64> {
+    let count: u32 = env
+        .storage()
+        .persistent()
+        .get(&active_sender_count_key(env, sender))
+        .unwrap_or(0u32);
+    let mut ids = Vec::new(env);
+    for i in 0..count {
+        if let Some(id) = env
+            .storage()
+            .persistent()
+            .get::<(Symbol, Address, u32), u64>(&active_sender_slot_key(env, sender, i))
+        {
+            ids.push_back(id);
+        }
+    }
+    ids
 }
 
 /// Removes a stream ID from the recipient's index (swap-and-pop).
